@@ -7,6 +7,7 @@
 package sqlite
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/syncthing/syncthing/internal/db"
@@ -393,5 +394,89 @@ func TestRemoteSequence(t *testing.T) {
 		seqs[protocol.DeviceID{44}] != 44 {
 		t.Log(seqs)
 		t.Error("bad seqs")
+	}
+}
+
+func TestAllLocalBlocksWithHashWithoutStats(t *testing.T) {
+	t.Parallel()
+
+	sdb, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sdb.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	file := genFile("foo", 1, 0)
+	if err := sdb.Update(folderID, protocol.LocalDeviceID, []protocol.FileInfo{file}); err != nil {
+		t.Fatal(err)
+	}
+
+	fdb, err := sdb.getFolderDB(folderID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh folder database has no ANALYZE statistics.
+	var statCount int
+	if err := fdb.sql.Get(&statCount, `SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'`); err != nil {
+		t.Fatal(err)
+	}
+	if statCount != 0 {
+		t.Fatalf("expected no sqlite_stat1 on fresh folder db, got %d", statCount)
+	}
+
+	// Lookups still return the correct results.
+	hits, err := itererr.Collect(sdb.AllLocalBlocksWithHash(folderID, file.Blocks[0].Hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].FileName != "foo" {
+		t.Fatalf("unexpected hits: %+v", hits)
+	}
+	if hits, err := itererr.Collect(sdb.AllLocalBlocksWithHash(folderID, []byte("missing"))); err != nil {
+		t.Fatal(err)
+	} else if len(hits) != 0 {
+		t.Fatalf("expected no hits for missing block, got %+v", hits)
+	}
+
+	// Find the prepared statement used by AllLocalBlocksWithHash and verify
+	// its plan starts from the blocks table even without stats.
+	fdb.statementsMut.RLock()
+	var querySQL string
+	for tpl := range fdb.statements {
+		expanded := fdb.expandTemplateVars(tpl)
+		if strings.Contains(expanded, "blocklisthash") && strings.Contains(expanded, "b.hash = ?") {
+			querySQL = expanded
+			break
+		}
+	}
+	fdb.statementsMut.RUnlock()
+	if querySQL == "" {
+		t.Fatal("failed to find prepared statement for AllLocalBlocksWithHash")
+	}
+
+	type eqpRow struct {
+		ID      int    `db:"id"`
+		Parent  int    `db:"parent"`
+		NotUsed int    `db:"notused"`
+		Detail  string `db:"detail"`
+	}
+	var plan []eqpRow
+	if err := fdb.sql.Select(&plan, `EXPLAIN QUERY PLAN `+querySQL, file.Blocks[0].Hash); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("empty query plan")
+	}
+	t.Logf("query plan without stats: %+v", plan)
+
+	// The first step must be a primary key lookup on blocks. Starting from
+	// files instead walks every local file, which is the regression in #10947.
+	if !strings.HasPrefix(plan[0].Detail, "SEARCH b USING PRIMARY KEY (hash=?)") {
+		t.Fatalf("expected query plan to start from blocks primary key, got %q", plan[0].Detail)
 	}
 }

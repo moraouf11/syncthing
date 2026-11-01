@@ -105,10 +105,15 @@ func (s *folderDB) AllLocalBlocksWithHash(hash []byte) (iter.Seq[db.BlockMapEntr
 	// We involve the files table in this select because deletion of blocks
 	// & blocklists is deferred (garbage collected) while the files list is
 	// not. This filters out blocks that are in fact deleted.
+	//
+	// Start from the blocks table and prevent the planner from reordering the
+	// join, so a lookup by hash uses the blocks primary key even when the
+	// database has no sqlite_stat1 statistics yet. Otherwise the planner may
+	// walk every local file in the files table for each lookup (ref #10947).
 	return iterStructs[db.BlockMapEntry](s.stmt(`
-		SELECT f.blocklist_hash as blocklisthash, b.idx as blockindex, b.offset, b.size, n.name as filename FROM files f
+		SELECT f.blocklist_hash as blocklisthash, b.idx as blockindex, b.offset, b.size, n.name as filename FROM blocks b
+		CROSS JOIN files f ON f.blocklist_hash = b.blocklist_hash
 		INNER JOIN file_names n ON f.name_idx = n.idx
-		LEFT JOIN blocks b ON f.blocklist_hash = b.blocklist_hash
 		WHERE f.device_idx = {{.LocalDeviceIdx}} AND b.hash = ?
 	`).Queryx(hash))
 }
